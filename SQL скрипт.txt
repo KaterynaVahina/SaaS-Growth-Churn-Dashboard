@@ -1,0 +1,173 @@
+WITH
+
+-- Детальні дані про кожен платіж + атрибути користувача
+detailed_payments AS (
+    SELECT
+        project.games_payments.user_id,
+        project.games_payments.payment_date,
+        project.games_payments.revenue_amount_usd,
+        DATE_TRUNC('month', project.games_payments.payment_date)::DATE AS payment_month,
+        project.games_paid_users.language,
+        project.games_paid_users.age,
+        project.games_paid_users.has_older_device_model
+    FROM project.games_payments
+    INNER JOIN project.games_paid_users 
+        ON project.games_payments.user_id = project.games_paid_users.user_id
+),
+
+-- Перший і останній місяць кожного користувача
+user_first_last AS (
+    SELECT
+        user_id,
+        MIN(payment_month) AS first_payment_month,
+        MAX(payment_month) AS last_payment_month
+    FROM detailed_payments
+    GROUP BY user_id
+),
+
+-- Місячні метрики
+monthly_activity AS (
+    SELECT
+        user_id,
+        payment_month,
+        SUM(revenue_amount_usd) AS MRR_this_month
+    FROM detailed_payments
+    GROUP BY user_id, payment_month
+),
+
+first_payment_month AS (
+    SELECT
+        user_id,
+        MIN(payment_month) AS first_month
+    FROM detailed_payments
+    GROUP BY user_id
+),
+
+main_metrics_monthly AS (
+    SELECT
+        monthly_activity.payment_month AS reporting_month,
+        ROUND(SUM(monthly_activity.MRR_this_month), 0) AS MRR,
+        COUNT(DISTINCT monthly_activity.user_id) AS Paid_Users,
+        ROUND(SUM(
+            CASE WHEN first_payment_month.first_month = monthly_activity.payment_month
+                 THEN monthly_activity.MRR_this_month ELSE 0 END), 0) AS New_MRR,
+        COUNT(DISTINCT
+            CASE WHEN first_payment_month.first_month = monthly_activity.payment_month
+                 THEN monthly_activity.user_id  END) AS New_Paid_Users
+    FROM monthly_activity
+    LEFT JOIN first_payment_month
+        ON monthly_activity.user_id = first_payment_month.user_id
+    GROUP BY monthly_activity.payment_month
+),
+
+churned_by_month AS (
+    SELECT
+        monthly_activity_prev.payment_month + INTERVAL '1 month' AS reporting_month,
+        COUNT(DISTINCT monthly_activity_prev.user_id) AS Churned_Users,
+        ROUND(SUM(monthly_activity_prev.MRR_this_month), 0) AS Churned_Revenue
+    FROM monthly_activity AS monthly_activity_prev
+    LEFT JOIN monthly_activity AS monthly_activity_curr
+        ON monthly_activity_prev.user_id = monthly_activity_curr.user_id
+        AND monthly_activity_curr.payment_month = monthly_activity_prev.payment_month + INTERVAL '1 month'
+    WHERE monthly_activity_curr.user_id IS NULL
+    GROUP BY monthly_activity_prev.payment_month
+),
+
+expansion_contraction AS (
+    SELECT
+        monthly_activity_curr.payment_month AS reporting_month,
+        ROUND(SUM(
+            CASE WHEN monthly_activity_curr.MRR_this_month > monthly_activity_prev.MRR_this_month
+                 THEN monthly_activity_curr.MRR_this_month - monthly_activity_prev.MRR_this_month
+                 ELSE 0
+            END
+        ), 0) AS Expansion_MRR,
+        ROUND(SUM(
+            CASE WHEN monthly_activity_curr.MRR_this_month < monthly_activity_prev.MRR_this_month
+                 THEN monthly_activity_curr.MRR_this_month - monthly_activity_prev.MRR_this_month
+                 ELSE 0
+            END
+        ), 0) AS Contraction_MRR
+    FROM monthly_activity AS monthly_activity_curr
+    INNER JOIN monthly_activity AS monthly_activity_prev
+        ON monthly_activity_curr.user_id = monthly_activity_prev.user_id
+        AND monthly_activity_curr.payment_month = monthly_activity_prev.payment_month + INTERVAL '1 month'
+    GROUP BY monthly_activity_curr.payment_month
+),
+
+-- Об’єднуємо всі місячні метрики + розраховуємо Churn Rate тут
+all_monthly_metrics AS (
+    SELECT
+        mmm.reporting_month,
+        mmm.MRR,
+        mmm.Paid_Users,
+        mmm.New_MRR,
+        mmm.New_Paid_Users,
+        COALESCE(cbm.Churned_Users, 0) AS Churned_Users,
+        COALESCE(cbm.Churned_Revenue, 0) AS Churned_Revenue,
+        COALESCE(ec.Expansion_MRR, 0) AS Expansion_MRR,
+        COALESCE(ec.Contraction_MRR, 0) AS Contraction_MRR,
+
+        -- Churn Rate у відсотках
+        ROUND(
+            100.0 * COALESCE(cbm.Churned_Users, 0) / 
+            NULLIF(LAG(mmm.Paid_Users) OVER (ORDER BY mmm.reporting_month), 0),
+            2
+        ) AS Churn_Rate_Pct,
+
+        -- Revenue Churn Rate у відсотках
+        ROUND(
+            100.0 * COALESCE(cbm.Churned_Revenue, 0) / 
+            NULLIF(LAG(mmm.MRR) OVER (ORDER BY mmm.reporting_month), 0),
+            2
+        ) AS Revenue_Churn_Rate_Pct
+
+    FROM main_metrics_monthly mmm
+    LEFT JOIN churned_by_month cbm
+        ON mmm.reporting_month = cbm.reporting_month
+    LEFT JOIN expansion_contraction ec
+        ON mmm.reporting_month = ec.reporting_month
+)
+
+-- Фінальна таблиця: один рядок на платіж
+SELECT
+    dp.user_id,
+    dp.payment_date,
+    dp.revenue_amount_usd,
+    dp.payment_month,
+    
+    -- Мітки першого/останнього платежу
+    CASE 
+        WHEN dp.payment_month = ufl.first_payment_month THEN TRUE 
+        ELSE FALSE 
+    END AS is_first_payment,
+    
+    CASE 
+        WHEN dp.payment_month = ufl.last_payment_month THEN TRUE 
+        ELSE FALSE 
+    END AS is_last_payment,
+    
+    -- Атрибути користувача
+    dp.language,
+    dp.age,
+    dp.has_older_device_model,
+    
+    -- Місячні метрики
+    amm.MRR,
+    amm.Paid_Users,
+    amm.New_MRR,
+    amm.New_Paid_Users,
+    amm.Churned_Users,
+    amm.Churned_Revenue,
+    amm.Expansion_MRR,
+    amm.Contraction_MRR,
+    amm.Churn_Rate_Pct,
+    amm.Revenue_Churn_Rate_Pct
+
+FROM detailed_payments dp
+INNER JOIN user_first_last ufl
+    ON dp.user_id = ufl.user_id
+INNER JOIN all_monthly_metrics amm
+    ON dp.payment_month = amm.reporting_month
+
+ORDER BY dp.user_id, dp.payment_date;
